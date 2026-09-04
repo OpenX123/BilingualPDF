@@ -1,0 +1,16 @@
+BilingualPDF
+
+This repository is an independently maintained redistribution and modification
+of the PDFMathTranslate-next project. It remains licensed under the GNU Affero
+General Public License v3.0; see LICENSE.
+
+Upstream and third-party attribution:
+
+- Original project: PDFMathTranslate-next by its original contributors.
+- PDF translation backend: BabelDOC (https://github.com/funstory-ai/BabelDOC).
+- Additional dependencies and integrations are listed in pyproject.toml and
+  retain their respective licenses and notices.
+
+The BilingualPDF name, repository metadata, and maintainer information in this
+repository refer to the current maintainer, OpenX123. This notice does not
+remove or replace copyright notices required by the AGPL or by dependencies.

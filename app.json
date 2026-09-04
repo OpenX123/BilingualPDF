@@ -1,0 +1,5 @@
+{
+    "name": "BilingualPDF",
+    "description": "Translate PDF documents while preserving layout and comparing bilingual output.",
+    "repository": "https://github.com/OpenX123/BilingualPDF"
+}
