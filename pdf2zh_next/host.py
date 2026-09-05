@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import html
 import os
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from pdf2zh_next.runtime import TierProfile, get_config_repository, production_secrets_valid, validate_admin_token
@@ -35,6 +37,11 @@ class TierTest(BaseModel):
     api_key: str
 
 
+class AdminLogin(BaseModel):
+    username: str
+    token: str
+
+
 def create_app(*, data_dir: str | Path | None = None, production: bool = False) -> FastAPI:
     if not production_secrets_valid(production=production):
         raise RuntimeError("BILINGUALPDF_ADMIN_TOKEN and BILINGUALPDF_SESSION_SECRET are required in production")
@@ -45,6 +52,10 @@ def create_app(*, data_dir: str | Path | None = None, production: bool = False) 
     app = FastAPI(title="BilingualPDF", docs_url=None, redoc_url=None)
     app.state.config_repo = repo
     basic = HTTPBasic(auto_error=False)
+    session_secret = os.getenv("BILINGUALPDF_SESSION_SECRET", "dev-session-secret")
+    admin_cookie = hmac.new(
+        session_secret.encode(), admin_token.encode(), hashlib.sha256
+    ).hexdigest()
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -69,24 +80,64 @@ def create_app(*, data_dir: str | Path | None = None, production: bool = False) 
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    def require_admin(
-        credentials: HTTPBasicCredentials | None = Depends(basic),
-        x_admin_token: str | None = Header(default=None),
-    ) -> None:
+    def is_admin(
+        request: Request,
+        credentials: HTTPBasicCredentials | None,
+        x_admin_token: str | None,
+    ) -> bool:
+        cookie_ok = validate_admin_token(
+            request.cookies.get("bilingualpdf_admin"), admin_cookie
+        )
+        header_ok = validate_admin_token(x_admin_token, admin_token)
         basic_ok = bool(
             credentials
             and validate_admin_token(credentials.username, "admin")
             and validate_admin_token(credentials.password, admin_token)
         )
-        if not basic_ok and not validate_admin_token(x_admin_token, admin_token):
+        return cookie_ok or header_ok or basic_ok
+
+    def require_admin(
+        request: Request,
+        credentials: HTTPBasicCredentials | None = Depends(basic),
+        x_admin_token: str | None = Header(default=None),
+    ) -> None:
+        if not is_admin(request, credentials, x_admin_token):
             raise HTTPException(
                 status_code=401,
                 detail="管理员认证失败",
-                headers={"WWW-Authenticate": 'Basic realm="BilingualPDF Admin"'},
             )
 
+    def login_page() -> str:
+        return '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>管理登录</title><style>
+        :root{font-family:system-ui;color:#172033;background:#f4f6f8}body{min-height:90vh;display:grid;place-items:center;margin:0;padding:20px}.login{width:min(400px,100%);box-sizing:border-box;background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:28px}h1{font-size:24px;margin-top:0}label{display:block;margin:16px 0}input{box-sizing:border-box;width:100%;min-height:44px;margin-top:6px;padding:9px;border:1px solid #aeb7c5;border-radius:6px}button{width:100%;min-height:44px;border:0;border-radius:6px;background:#d9287a;color:#fff;font-weight:650;cursor:pointer}#error{color:#b42318;min-height:24px}</style></head><body><main class="login"><h1>BilingualPDF 管理登录</h1><p>使用管理员账号和管理密钥登录。</p><form onsubmit="login(event)"><label>用户名<input name="username" value="admin" autocomplete="username"></label><label>管理密钥<input name="token" type="password" autocomplete="current-password" autofocus></label><p id="error"></p><button>登录</button></form></main><script>
+        async function login(e){e.preventDefault();const f=new FormData(e.target);const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:f.get('username'),token:f.get('token')})});if(r.ok){location.href='/admin'}else{document.querySelector('#error').textContent='用户名或管理密钥错误'}}</script></body></html>'''
+
+    @app.post("/admin/login")
+    def admin_login(login: AdminLogin) -> JSONResponse:
+        if not (
+            validate_admin_token(login.username, "admin")
+            and validate_admin_token(login.token, admin_token)
+        ):
+            raise HTTPException(status_code=401, detail="管理员认证失败")
+        response = JSONResponse({"status": "ok"})
+        response.set_cookie(
+            "bilingualpdf_admin",
+            admin_cookie,
+            max_age=12 * 3600,
+            httponly=True,
+            secure=production,
+            samesite="strict",
+        )
+        return response
+
     @app.get("/admin", response_class=HTMLResponse)
-    def admin_page(_: None = Depends(require_admin)) -> str:
+    def admin_page(
+        request: Request,
+        credentials: HTTPBasicCredentials | None = Depends(basic),
+        x_admin_token: str | None = Header(default=None),
+    ) -> str:
+        if not is_admin(request, credentials, x_admin_token):
+            return login_page()
         from pdf2zh_next.history import history_repository
 
         profiles = repo.profiles()
