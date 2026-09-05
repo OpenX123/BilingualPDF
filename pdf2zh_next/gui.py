@@ -49,9 +49,9 @@ logger = logging.getLogger(__name__)
 # This deployment intentionally exposes one translation gateway in the GUI.
 # The OpenAI-compatible adapter appends /chat/completions to this base URL.
 PRIMARY_TRANSLATION_SERVICE = "OpenAICompatible"
-PRIMARY_TRANSLATION_BASE_URL = "https://serve.yiyongai.cn/v1"
+PRIMARY_TRANSLATION_BASE_URL = "https://api.minimaxi.com/v1"
 SERVICE_DISPLAY_NAMES = {
-    PRIMARY_TRANSLATION_SERVICE: "易用 AI（serve.yiyongai.cn）",
+    PRIMARY_TRANSLATION_SERVICE: "MiniMax",
 }
 SERVICE_FIELD_LABELS = {
     "openai_compatible_model": "模型名称",
@@ -348,8 +348,7 @@ for display_name, code in lang_map.items():
 else:
     default_lang_to = "Simplified Chinese"  # Fallback
 
-# Available translation services. This build intentionally keeps the UI on the
-# YiYong gateway so users do not accidentally send documents to another provider.
+# Available translation services. Keep one focused provider in the simplified UI.
 available_services = [PRIMARY_TRANSLATION_SERVICE]
 active_term_engine_metadata = [
     metadata
@@ -3710,7 +3709,7 @@ tech_details_string = f"""
                     - GUI by: <a href="https://github.com/reycn">Rongxin</a> & <a href="https://github.com/hellofinch">hellofinch</a> & <a href="https://github.com/OpenX123">OpenX123</a> & <a href="https://github.com/zfb132">zfb132</a><br>
                     - pdf2zh Version: {__version__} <br>
                     - BabelDOC Version: {babeldoc_version}<br>
-                    - Translation gateway: <a href="{PRIMARY_TRANSLATION_BASE_URL}" target="_blank" style="text-decoration: none;">serve.yiyongai.cn</a><br>
+                    - Translation gateway: MiniMax OpenAI-compatible API<br>
                     <br>
                 """
 update_current_languages(settings.gui_settings.ui_lang)
@@ -4031,7 +4030,7 @@ with gr.Blocks(
                         elem_classes=["auth-notice", "secondary-text"],
                     )
                     siliconflow_free_acknowledgement = gr.Markdown(
-                        f"当前唯一翻译渠道：**{_service_display_name(PRIMARY_TRANSLATION_SERVICE)}**  服务器地址：`{PRIMARY_TRANSLATION_BASE_URL}`。请在下方填写模型名称和 API Key。",
+                        f"当前翻译渠道：**{_service_display_name(PRIMARY_TRANSLATION_SERVICE)}**。请填写 API Key；其他参数已提供默认值。",
                         visible=True,
                     )
 
@@ -4100,6 +4099,8 @@ with gr.Blocks(
                                         visible,
                                         field_values,
                                     )
+                                    if field_name == "openai_compatible_base_url":
+                                        field_visible = False
                                     if gui_extra.get("widget") == "dropdown":
                                         field_input = gr.Dropdown(
                                             label=_service_field_label(
@@ -5772,6 +5773,8 @@ with gr.Blocks(
                             metadata.translate_engine_type == selected_service,
                             field_values,
                         )
+                        if field_name == "openai_compatible_base_url":
+                            visible = False
                         value = _gui_field_value(field, value)
                         updates.append(gr.update(value=value, visible=visible))
 

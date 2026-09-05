@@ -711,32 +711,33 @@ class OpenAICompatibleSettings(BaseModel):
     )
 
     openai_compatible_model: str = Field(
-        default="gpt-4o-mini", description="OpenAI Compatible model to use"
+        default="MiniMax-M2.7", description="OpenAI Compatible model to use"
     )
     openai_compatible_base_url: str | None = Field(
-        default=None, description="Base URL for OpenAI Compatible service"
+        default="https://api.minimaxi.com/v1",
+        description="Base URL for OpenAI Compatible service",
     )
     openai_compatible_api_key: str | None = Field(
         default=None, description="API key for OpenAI Compatible service"
     )
     openai_compatible_timeout: str | None = Field(
-        default=None, description="Timeout (seconds) for OpenAI Compatible service"
+        default="120", description="Timeout (seconds) for OpenAI Compatible service"
     )
     openai_compatible_temperature: str | None = Field(
-        default=None, description="Temperature for OpenAI Compatible service"
+        default="0.2", description="Temperature for OpenAI Compatible service"
     )
     openai_compatible_reasoning_effort: str | None = Field(
         default=None,
         description="Reasoning effort for OpenAI Compatible service (minimal/low/medium/high)",
     )
     openai_compatible_send_temperature: bool | None = Field(
-        default=None, description="Send temperature to OpenAI Compatible service"
+        default=True, description="Send temperature to OpenAI Compatible service"
     )
     openai_compatible_send_reasoning_effort: bool | None = Field(
         default=None, description="Send reasoning effort to OpenAI Compatible service"
     )
     openai_compatible_enable_json_mode: bool | None = Field(
-        default=None, description="Enable JSON mode for OpenAI Compatible service"
+        default=False, description="Enable JSON mode for OpenAI Compatible service"
     )
 
     def validate_settings(self) -> None:
