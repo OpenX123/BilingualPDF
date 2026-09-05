@@ -1,7 +1,9 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from pdf2zh_next.history import HistoryRepository
+from pdf2zh_next.history import TranslationJob
 from pdf2zh_next.history import sanitize_config_snapshot
 
 
@@ -125,3 +127,22 @@ def test_path_guard_and_snapshot_redaction(repository: HistoryRepository):
     assert "service_endpoint" not in snapshot
     assert snapshot["lang_from"] == "English"
     assert snapshot["nested"] == {"value": 1}
+
+
+def test_retention_removes_files_then_metadata(repository: HistoryRepository):
+    job_id = repository.create_job("alice", source_lang="en", target_lang="zh", service="OpenAI", config={})
+    root = repository.job_directory("alice", job_id)
+    source = root / "paper.pdf"
+    source.write_bytes(b"pdf")
+    repository.add_file("alice", job_id, original_name="paper.pdf", input_path=source)
+    repository.update_status("alice", job_id, "success")
+    old = datetime.now(timezone.utc) - timedelta(days=8)
+    TranslationJob.update(created_at=old).where(TranslationJob.job_id == job_id).execute()
+    assert repository.cleanup_retention(now=datetime.now(timezone.utc)) == {"files": 1, "jobs": 0}
+    assert not root.exists()
+
+    very_old = datetime.now(timezone.utc) - timedelta(days=91)
+    TranslationJob.update(created_at=very_old).where(TranslationJob.job_id == job_id).execute()
+    result = repository.cleanup_retention(now=datetime.now(timezone.utc))
+    assert result["jobs"] == 1
+    assert repository.list_jobs("alice") == []

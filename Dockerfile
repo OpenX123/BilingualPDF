@@ -6,6 +6,10 @@ WORKDIR /app
 EXPOSE 7860
 
 ENV PYTHONUNBUFFERED=1
+ENV BILINGUALPDF_DATA_DIR=/data
+ENV BILINGUALPDF_PRODUCTION=1
+
+VOLUME ["/data"]
 
 # # Download all required fonts
 # ADD "https://github.com/satbyy/go-noto-universal/releases/download/v7.0/GoNotoKurrent-Regular.ttf" /app/

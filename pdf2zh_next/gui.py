@@ -5,8 +5,10 @@ import csv
 import html
 import io
 import logging
+import os
 import shutil
 import tempfile
+import threading
 import typing
 import zipfile
 from enum import Enum
@@ -45,6 +47,8 @@ from pdf2zh_next.i18n import gettext as _
 from pdf2zh_next.i18n import update_current_languages
 
 logger = logging.getLogger(__name__)
+_active_owner_lock = threading.Lock()
+_active_owner_jobs: dict[str, int] = {}
 
 # This deployment intentionally exposes one translation gateway in the GUI.
 # The OpenAI-compatible adapter appends /chat/completions to this base URL.
@@ -53,6 +57,7 @@ PRIMARY_TRANSLATION_BASE_URL = "https://api.minimaxi.com/v1"
 SERVICE_DISPLAY_NAMES = {
     PRIMARY_TRANSLATION_SERVICE: "MiniMax",
 }
+TIER_DISPLAY_NAMES = {"standard": "普通版", "advanced": "高级版"}
 SERVICE_FIELD_LABELS = {
     "openai_compatible_model": "模型名称",
     "openai_compatible_base_url": "API 地址",
@@ -70,15 +75,64 @@ def _service_display_name(service_name: str | None) -> str:
     return SERVICE_DISPLAY_NAMES.get(service_name or "", service_name or "-")
 
 
+def _tier_display_name(tier_slug: str | None) -> str:
+    return TIER_DISPLAY_NAMES.get(tier_slug or "standard", "普通版")
+
+
+def _apply_tier_profile(ui_inputs: dict[str, typing.Any]) -> tuple[str, typing.Any]:
+    from pdf2zh_next.runtime import get_config_repository
+
+    state = ui_inputs.get("state") or {}
+    tier_slug = state.get("tier_slug", "standard")
+    try:
+        profile = get_config_repository().get_profile(tier_slug)
+    except KeyError:
+        tier_slug = "standard"
+        profile = get_config_repository().get_profile(tier_slug)
+    if not profile.enabled:
+        raise gr.Error("所选翻译版本当前不可用，请选择普通版。")
+    ui_inputs.update(
+        service=PRIMARY_TRANSLATION_SERVICE,
+        openai_compatible_model=profile.model,
+        openai_compatible_base_url=profile.base_url,
+        openai_compatible_timeout=str(profile.timeout),
+        openai_compatible_temperature=str(profile.temperature),
+        openai_compatible_reasoning_effort=profile.reasoning_effort or None,
+        openai_compatible_send_temperature=True,
+        openai_compatible_send_reasoning_effort=bool(profile.reasoning_effort),
+        openai_compatible_enable_json_mode=profile.json_mode,
+        custom_qps=profile.qps,
+        custom_pool_workers=profile.workers,
+    )
+    if profile.prompt:
+        ui_inputs["custom_system_prompt_input"] = profile.prompt
+    return tier_slug, profile
+
+
 def _service_field_label(field_name: str, fallback: str | None) -> str:
     normalized_name = field_name.removeprefix("term_")
     return SERVICE_FIELD_LABELS.get(normalized_name, fallback or field_name)
 
 
 def _request_owner(request: gr.Request | None = None) -> str:
-    """Resolve the authenticated Gradio user, with a local fallback."""
-
-    return normalize_owner(getattr(request, "username", None) if request else None)
+    """Resolve signed anonymous identity, then authenticated user."""
+    username = getattr(request, "username", None) if request else None
+    if username:
+        return normalize_owner(username)
+    raw_request = getattr(request, "request", None) if request else None
+    cookie = getattr(raw_request, "cookies", {}).get("bilingualpdf_session") if raw_request else None
+    if cookie:
+        from pdf2zh_next.runtime import owner_hash_from_cookie
+        owner = owner_hash_from_cookie(cookie, os.getenv("BILINGUALPDF_SESSION_SECRET", "dev-session-secret"))
+        if owner:
+            return normalize_owner(owner)
+    # A per-request session hash avoids cross-browser history sharing while a
+    # response cookie is being established by the host middleware.
+    session_hash = getattr(request, "session_hash", None) if request else None
+    if session_hash:
+        import hashlib
+        return hashlib.sha256(str(session_hash).encode()).hexdigest()[:24]
+    return normalize_owner(None)
 
 
 class SaveMode(Enum):
@@ -954,6 +1008,13 @@ def _build_translate_settings(
             should_save = not temp_settings.gui_settings.disable_config_auto_save
         # SaveMode.never: should_save remains False
 
+        # User-provided API keys are request-scoped and must never reach the
+        # TOML config writer, even when the legacy save button is used.
+        engine_settings = getattr(translate_settings, "translate_engine_settings", None)
+        if engine_settings and getattr(
+            engine_settings, "openai_compatible_api_key", None
+        ):
+            should_save = False
         if should_save:
             config_manager.write_user_default_config_file(settings=translate_settings)
             global settings
@@ -1222,7 +1283,13 @@ async def translate_files(
     # Build ui_inputs from *args
     ui_inputs = build_ui_inputs(*ui_args)
     state = ui_inputs["state"]
+    tier_slug, tier_profile = _apply_tier_profile(ui_inputs)
     owner_id = _request_owner(request)
+    with _active_owner_lock:
+        active_for_owner = _active_owner_jobs.get(owner_id, 0)
+        if active_for_owner >= 2:
+            raise gr.Error("当前浏览器已有 2 个任务在运行，请等待其中一个完成后重试。")
+        _active_owner_jobs[owner_id] = active_for_owner + 1
     retry_of = state.get("retry_of") if isinstance(state, dict) else None
     if isinstance(state, dict):
         state["retry_of"] = None
@@ -1234,6 +1301,9 @@ async def translate_files(
         target_lang=ui_inputs.get("lang_to"),
         service=ui_inputs.get("service"),
         config=sanitize_config_snapshot(ui_inputs),
+        tier_slug=tier_slug,
+        tier_version=tier_profile.version,
+        model_snapshot=tier_profile.model,
         retry_of=retry_of,
     )
 
@@ -1318,6 +1388,14 @@ async def translate_files(
             file_type, file_input, link_input, output_dir, state
         )
         total_files = len(file_paths)
+        if total_files > 10:
+            raise gr.Error("每次最多翻译 10 个 PDF，请减少文件数量后重试。")
+        for prepared_path in file_paths:
+            if prepared_path.stat().st_size > 100 * 1024 * 1024:
+                raise gr.Error(f"{prepared_path.name} 超过 100 MB 文件限制。")
+            page_count = _pdf_page_count(prepared_path)
+            if page_count is not None and page_count > 800:
+                raise gr.Error(f"{prepared_path.name} 超过 800 页限制。")
 
         for prepared_path in file_paths:
             history_file_ids[prepared_path.name] = history_repository.add_file(
@@ -1615,6 +1693,12 @@ async def translate_files(
         raise gr.Error(f"Translation failed: {e}") from e
     finally:
         state["current_task"] = None
+        with _active_owner_lock:
+            remaining = _active_owner_jobs.get(owner_id, 1) - 1
+            if remaining > 0:
+                _active_owner_jobs[owner_id] = remaining
+            else:
+                _active_owner_jobs.pop(owner_id, None)
 
 
 def swap_languages(lang_from_value, lang_to_value):
@@ -2042,7 +2126,7 @@ def _history_table_data(
                 (job.get("created_at") or "").replace("T", " ")[:19],
                 names,
                 f"{job.get('source_lang') or '-'} -> {job.get('target_lang') or '-'}",
-                _service_display_name(job.get("service")),
+                _tier_display_name(job.get("tier_slug")),
                 _HISTORY_STATUS_LABELS.get(job.get("status"), job.get("status", "")),
                 job.get("file_count", 0),
                 job.get("job_id", "")[:8],
@@ -2119,7 +2203,7 @@ def load_history_detail(
         f"**Status:** {_HISTORY_STATUS_LABELS.get(job.get('status'), job.get('status', '-'))}  "
         f"**Direction:** {html.escape(str(job.get('source_lang') or '-'))} -> "
         f"{html.escape(str(job.get('target_lang') or '-'))}  "
-        f"**Service:** {html.escape(_service_display_name(job.get('service')))}\n\n"
+        f"**版本:** {html.escape(_tier_display_name(job.get('tier_slug')))}\n\n"
         f"**Tokens:** {job.get('token_total', 0):,}  "
         f"**Pages:** {job.get('total_pages') or '-'}"
     )
@@ -3825,11 +3909,19 @@ with gr.Blocks(
                             service = gr.Dropdown(
                                 label=_("Translation service"),
                                 choices=[
-                                    (_service_display_name(service_name), service_name)
+                                    (("普通版" if service_name == PRIMARY_TRANSLATION_SERVICE else "高级版"), service_name)
                                     for service_name in available_services
                                 ],
                                 value=available_services[0],
                                 elem_classes=["primary-service-select"],
+                                visible=False,
+                            )
+                            tier_selector = gr.Radio(
+                                choices=[("普通版", "standard")],
+                                value="standard",
+                                label="翻译版本",
+                                visible=True,
+                                elem_classes=["tier-selector"],
                             )
 
                             # 语言选择与交换按钮所在的一行
@@ -3851,6 +3943,29 @@ with gr.Blocks(
                                     choices=list(lang_map.keys()),
                                     value=default_lang_to,
                                 )
+
+                            page_range = gr.Radio(
+                                choices=[
+                                    ("全部", "All"),
+                                    ("第一页", "First"),
+                                    ("前 5 页", "First 5 pages"),
+                                    ("指定页码", "Range"),
+                                ],
+                                label="翻译页码",
+                                value="All",
+                            )
+                            page_input = gr.Textbox(
+                                label="页码范围",
+                                visible=False,
+                                interactive=True,
+                                placeholder="例如：1,3,5-10",
+                            )
+                            only_include_translated_page = gr.Checkbox(
+                                label="结果仅保留所选页面",
+                                value=settings.pdf.only_include_translated_page,
+                                interactive=True,
+                                visible=False,
+                            )
 
                             # 主界面左侧保留翻译按钮和已翻译下载区
                             output_title = gr.Markdown(_("## Translated"), visible=False)
@@ -3914,9 +4029,7 @@ with gr.Blocks(
                 ) as tab_history:
                     gr.Markdown(_("## Translation history"), elem_classes=["tab-title"])
                     auth_notice_history = gr.Markdown(
-                        _(
-                            "History ownership follows Gradio accounts. Without auth_file, this instance uses the local user."
-                        ),
+                        "历史记录仅在当前浏览器中可见，任务文件保留 7 天。",
                         elem_classes=["auth-notice", "secondary-text"],
                     )
                     gr.Markdown(
@@ -3954,7 +4067,7 @@ with gr.Blocks(
                             _("Created"),
                             _("Files"),
                             _("Direction"),
-                            _("Service"),
+                            _("Version"),
                             _("Status"),
                             _("Count"),
                             _("Job"),
@@ -4024,23 +4137,48 @@ with gr.Blocks(
                         elem_classes=["theme-mode-control"],
                     )
                     auth_notice_settings = gr.Markdown(
-                        _(
-                            "History ownership follows Gradio accounts. Without auth_file, this instance uses the local user."
-                        ),
+                        "API Key 仅保存在当前浏览器中，翻译时临时发送，不会写入服务器。",
                         elem_classes=["auth-notice", "secondary-text"],
                     )
                     siliconflow_free_acknowledgement = gr.Markdown(
                         f"当前翻译渠道：**{_service_display_name(PRIMARY_TRANSLATION_SERVICE)}**。请填写 API Key；其他参数已提供默认值。",
-                        visible=True,
+                        visible=False,
                     )
 
                     detail_index = 0
                     term_detail_index = 0
                     with gr.Accordion(
-                        "易用 AI 渠道配置", open=True
+                        "API Key", open=True
                     ) as translation_engine_settings:
+                        api_key_status = gr.Markdown(
+                            "Key 仅保存在当前浏览器，不会写入服务器。",
+                            elem_classes=["secondary-text"],
+                        )
+                        clear_saved_key_btn = gr.Button(
+                            "清除已保存 Key", variant="secondary", size="sm"
+                        )
+                        gr.HTML("""
+                        <script>
+                        (() => {
+                          const key = 'bilingualpdf-api-key';
+                          const sync = () => {
+                            const input = document.querySelector('input[type=password]');
+                            if (!input || input.dataset.keySync) return;
+                            const saved = localStorage.getItem(key) || '';
+                            if (!input.value && saved) {
+                              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                              setter.call(input, saved);
+                              input.dispatchEvent(new Event('input', { bubbles: true }));
+                            }
+                            input.dataset.keySync = '1';
+                            input.addEventListener('input', () => input.value ? localStorage.setItem(key, input.value) : localStorage.removeItem(key));
+                          };
+                          setTimeout(sync, 300); setInterval(sync, 1000);
+                        })();
+                        </script>
+                        """)
                         gr.Markdown(
-                            "在这里配置模型名称、API 地址和 API Key。API Key 只用于调用当前翻译渠道，不会写入翻译历史。",
+                            "请输入你自己的 API Key。模型和服务参数由管理员统一配置。",
                             elem_classes=["secondary-text", "gateway-config-hint"],
                         )
                         __gui_service_arg_names = []
@@ -4099,6 +4237,10 @@ with gr.Blocks(
                                         visible,
                                         field_values,
                                     )
+                                    # Technical provider fields stay in the callback
+                                    # contract but are never exposed to end users.
+                                    if field_name not in GUI_PASSWORD_FIELDS:
+                                        field_visible = False
                                     if field_name == "openai_compatible_base_url":
                                         field_visible = False
                                     if gui_extra.get("widget") == "dropdown":
@@ -4179,7 +4321,7 @@ with gr.Blocks(
                                     detail_visibility_dependency_inputs[field_name] = field_input
                                     __gui_service_arg_names.append(field_name)
                                     translation_engine_arg_inputs.append(field_input)
-                    with gr.Accordion(_("Rate limit settings"), open=False) as rate_limit_settings:
+                    with gr.Accordion(_("Rate limit settings"), open=False, visible=False) as rate_limit_settings:
                         rate_limit_mode = gr.Radio(
                             choices=[
                                 ("RPM (Requests Per Minute)", "RPM"),
@@ -4244,7 +4386,7 @@ with gr.Blocks(
                         )
 
                     # Term extraction options (engine + rate limit + detail settings)
-                    with gr.Accordion(_("Auto Term Extraction"), open=False):
+                    with gr.Accordion(_("Auto Term Extraction"), open=False, visible=False):
                         enable_auto_term_extraction = gr.Checkbox(
                             label=_("Enable auto term extraction"),
                             value=not settings.translation.no_auto_extract_glossary,
@@ -4467,32 +4609,7 @@ with gr.Blocks(
                                 visible=True,
                             )
 
-                    page_range = gr.Radio(
-                        choices=[
-                            ("All", "All"),
-                            ("First", "First"),
-                            ("First 5 pages", "First 5 pages"),
-                            ("Range", "Range"),
-                        ],
-                        label="Pages",
-                        value="All",
-                    )
-
-                    page_input = gr.Textbox(
-                    label=_("Page range (e.g., 1,3,5-10,-5)"),
-                    visible=False,
-                    interactive=True,
-                    placeholder=_("e.g., 1,3,5-10"),
-                    )
-
-                    only_include_translated_page = gr.Checkbox(
-                    label=_("Only include translated pages in the output PDF."),
-                    info=_("Effective only when a page range is specified."),
-                    value=settings.pdf.only_include_translated_page,
-                    interactive=True,
-                    )
-
-                    with gr.Accordion(_("PDF Output Options"), open=False):
+                    with gr.Accordion(_("PDF Output Options"), open=False, visible=False):
                         with gr.Row():
                             no_mono = gr.Checkbox(
                                 label=_("Disable monolingual output"),
@@ -4529,7 +4646,7 @@ with gr.Blocks(
                         )
 
                     # Additional translation options
-                    with gr.Accordion(_("Advanced Options"), open=False):
+                    with gr.Accordion(_("Advanced Options"), open=False, visible=False):
                         prompt = gr.Textbox(
                         label=_("Custom prompt for translation"),
                         value="",
@@ -4749,11 +4866,12 @@ with gr.Blocks(
                         )
 
                     # （已移动到 tab_main 中）这里保留设置页底部的“保存设置”和技术说明
-                    save_btn = gr.Button(_("Save Settings"), variant="secondary", elem_classes=["save-settings-btn"])
+                    save_btn = gr.Button(_("Save Settings"), variant="secondary", elem_classes=["save-settings-btn"], visible=False)
 
                     tech_details = gr.Markdown(
                         tech_details_string,
                         elem_classes=["secondary-text"],
+                        visible=False,
                     )
 
         # Sidebar tab switching: 主界面 / 设置界面
@@ -5036,6 +5154,18 @@ with gr.Blocks(
             }
             """,
         )
+        clear_saved_key_btn.click(
+            fn=None,
+            js="""() => {
+                localStorage.removeItem('bilingualpdf-api-key');
+                const input = document.querySelector('input[type=password]');
+                if (input) {
+                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                    setter.call(input, '');
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }""",
+        )
 
         # State for managing translation tasks
         state = gr.State(
@@ -5047,7 +5177,30 @@ with gr.Blocks(
                 "display_map": {},
                 "parent_map": {},
                 "uploaded_files": [],
+                "tier_slug": "standard",
             }
+        )
+
+        def update_tier_state(tier_slug, current_state):
+            current_state = dict(current_state or {})
+            current_state["tier_slug"] = tier_slug or "standard"
+            return current_state
+
+        def load_tier_options(current_state):
+            from pdf2zh_next.runtime import get_config_repository
+
+            profiles = get_config_repository().profiles(enabled_only=True)
+            choices = [(profile.label, profile.slug) for profile in profiles]
+            available = {profile.slug for profile in profiles}
+            selected = (current_state or {}).get("tier_slug", "standard")
+            if selected not in available:
+                selected = "standard"
+            return gr.update(choices=choices, value=selected)
+
+        tier_selector.change(
+            update_tier_state,
+            inputs=[tier_selector, state],
+            outputs=[state],
         )
 
         history_view_outputs = [history_table, history_job_selector, history_empty_state]
@@ -5773,7 +5926,7 @@ with gr.Blocks(
                             metadata.translate_engine_type == selected_service,
                             field_values,
                         )
-                        if field_name == "openai_compatible_base_url":
+                        if field_name not in GUI_PASSWORD_FIELDS:
                             visible = False
                         value = _gui_field_value(field, value)
                         updates.append(gr.update(value=value, visible=visible))
@@ -5822,7 +5975,7 @@ with gr.Blocks(
 
                 # Extra UI components at the end of ui_setting_controls
                 updates.append(
-                    gr.update(visible=selected_service == PRIMARY_TRANSLATION_SERVICE)
+                    gr.update(visible=False)
                 )
                 updates.append(
                     gr.update(visible=llm_support)
@@ -5840,6 +5993,7 @@ with gr.Blocks(
 
         # Use ui_setting_controls as outputs for page load
         demo.load(load_saved_config_to_ui, inputs=[state], outputs=ui_setting_controls)
+        demo.load(load_tier_options, inputs=[state], outputs=[tier_selector])
 
         # Initialize result_file_selector on page load to ensure choices and value are consistent
         def init_result_file_selector(state):
@@ -6126,6 +6280,9 @@ with gr.Blocks(
         )
 
 
+demo.queue(max_size=50, default_concurrency_limit=4)
+
+
 def parse_user_passwd(file_path: str, welcome_page: str) -> tuple[list, str]:
     """
     This function parses a user password file.
@@ -6175,6 +6332,16 @@ def setup_gui(
     Returns:
         - None
     """
+
+    # The public deployment is hosted by FastAPI so health checks, the
+    # protected admin API, and the user Gradio app share one origin.
+    if not auth_file and not share:
+        from pdf2zh_next.host import create_app
+        import uvicorn
+
+        app = create_app(production=bool(os.getenv("BILINGUALPDF_PRODUCTION")))
+        uvicorn.run(app, host="0.0.0.0", port=server_port, log_level="info")
+        return
 
     user_list = None
     html = None

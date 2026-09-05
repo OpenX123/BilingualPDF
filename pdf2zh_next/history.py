@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -33,8 +34,9 @@ from pdf2zh_next.const import DEFAULT_CONFIG_DIR
 
 logger = logging.getLogger(__name__)
 
-HISTORY_DB_PATH = DEFAULT_CONFIG_DIR / "history.v1.sqlite3"
-OUTPUT_ROOT = Path("pdf2zh_files")
+_DATA_DIR = os.getenv("BILINGUALPDF_DATA_DIR")
+HISTORY_DB_PATH = Path(_DATA_DIR) / "history.sqlite3" if _DATA_DIR else DEFAULT_CONFIG_DIR / "history.v1.sqlite3"
+OUTPUT_ROOT = Path(_DATA_DIR) / "tasks" if _DATA_DIR else Path("pdf2zh_files")
 _database_proxy = DatabaseProxy()
 
 
@@ -53,6 +55,9 @@ class TranslationJob(_HistoryModel):
     source_lang = CharField(null=True, max_length=32)
     target_lang = CharField(null=True, max_length=32)
     service = CharField(null=True, max_length=128)
+    tier_slug = CharField(null=True, index=True, max_length=32)
+    tier_version = IntegerField(null=True)
+    model_snapshot = CharField(null=True, max_length=256)
     file_count = IntegerField(default=0)
     total_size = IntegerField(default=0)
     total_pages = IntegerField(null=True)
@@ -233,6 +238,9 @@ class HistoryRepository:
             "zip_dual_path": "TEXT",
             "zip_glossary_path": "TEXT",
             "files_deleted_at": "DATETIME",
+            "tier_slug": "VARCHAR(32)",
+            "tier_version": "INTEGER",
+            "model_snapshot": "VARCHAR(256)",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -267,6 +275,9 @@ class HistoryRepository:
         target_lang: str | None,
         service: str | None,
         config: dict[str, Any] | None,
+        tier_slug: str | None = None,
+        tier_version: int | None = None,
+        model_snapshot: str | None = None,
         retry_of: str | None = None,
         job_id: str | None = None,
     ) -> str:
@@ -280,6 +291,9 @@ class HistoryRepository:
             source_lang=source_lang,
             target_lang=target_lang,
             service=service,
+            tier_slug=tier_slug,
+            tier_version=tier_version,
+            model_snapshot=model_snapshot,
             config_json=json.dumps(
                 sanitize_config_snapshot(config), ensure_ascii=True, sort_keys=True
             ),
@@ -457,6 +471,8 @@ class HistoryRepository:
             "source_lang": job.source_lang,
             "target_lang": job.target_lang,
             "service": job.service,
+            "tier_slug": job.tier_slug or ("standard" if job.service else None),
+            "tier_version": job.tier_version,
             "file_count": job.file_count,
             "total_size": job.total_size,
             "total_pages": job.total_pages,
@@ -556,6 +572,52 @@ class HistoryRepository:
             "config": result["config"],
             "files": result["files"],
         }
+
+    def admin_summary(self) -> dict[str, int]:
+        jobs = list(TranslationJob.select().where(TranslationJob.deleted_at.is_null(True)))
+        return {
+            "jobs": len(jobs),
+            "running": sum(job.status == "processing" for job in jobs),
+            "succeeded": sum(job.status == "success" for job in jobs),
+            "failed": sum(job.status == "failed" for job in jobs),
+            "files": sum(job.file_count or 0 for job in jobs),
+            "pages": sum(job.total_pages or 0 for job in jobs),
+            "tokens": sum(job.token_total or 0 for job in jobs),
+        }
+
+    def recent_failures(self, limit: int = 20) -> list[dict[str, Any]]:
+        query = (
+            TranslationJob.select()
+            .where((TranslationJob.status == "failed") & TranslationJob.deleted_at.is_null(True))
+            .order_by(TranslationJob.created_at.desc())
+            .limit(max(1, min(limit, 100)))
+        )
+        return [
+            {
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "tier": job.tier_slug or "standard",
+                "error": _compact_error(job.error_summary),
+            }
+            for job in query
+        ]
+
+    def cleanup_retention(self, *, file_days: int = 7, job_days: int = 90, now: datetime | None = None) -> dict[str, int]:
+        """Remove old files first, then old metadata; never touch active jobs."""
+        cutoff_files = (now or datetime.now(timezone.utc)).timestamp() - file_days * 86400
+        cutoff_jobs = (now or datetime.now(timezone.utc)).timestamp() - job_days * 86400
+        files_removed = jobs_removed = 0
+        for job in TranslationJob.select().where(TranslationJob.deleted_at.is_null(True)):
+            created = job.created_at.timestamp() if job.created_at else 0
+            if created < cutoff_files and not job.files_deleted_at and job.status != "processing":
+                try:
+                    self.delete_files(job.owner_id, job.job_id)
+                    files_removed += 1
+                except (LookupError, OSError):
+                    logger.warning("Unable to clean files for job %s", job.job_id)
+            if created < cutoff_jobs and job.status != "processing":
+                TranslationJob.update(deleted_at=datetime.now(timezone.utc)).where(TranslationJob.job_id == job.job_id).execute()
+                jobs_removed += 1
+        return {"files": files_removed, "jobs": jobs_removed}
 
 
 history_repository = HistoryRepository()

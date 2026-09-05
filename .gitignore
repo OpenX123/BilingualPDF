@@ -179,3 +179,7 @@ uv.lock
 *.pdf
 *.docx
 CLAUDE.md
+
+# Local BilingualPDF runtime state
+/data/
+/tmp-runtime-test/
