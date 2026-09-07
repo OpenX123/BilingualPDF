@@ -1,21 +1,37 @@
-"""FastAPI host for the public BilingualPDF service."""
+"""FastAPI host for the React BilingualPDF application."""
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import hashlib
 import hmac
-import html
 import os
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Depends
+from fastapi import FastAPI
+from fastapi import Header
+from fastapi import HTTPException
+from fastapi import Request
+from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response
+from fastapi.security import HTTPBasic
+from fastapi.security import HTTPBasicCredentials
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.staticfiles import StaticFiles
 
-from pdf2zh_next.runtime import TierProfile, get_config_repository, production_secrets_valid, validate_admin_token
+from pdf2zh_next.history import HistoryRepository
+from pdf2zh_next.runtime import TierProfile
+from pdf2zh_next.runtime import get_config_repository
+from pdf2zh_next.runtime import make_owner_cookie
+from pdf2zh_next.runtime import owner_hash_from_cookie
+from pdf2zh_next.runtime import production_secrets_valid
+from pdf2zh_next.runtime import validate_admin_token
+from pdf2zh_next.web import TranslationTaskManager
+from pdf2zh_next.web import create_api_router
 
 
 class TierUpdate(BaseModel):
@@ -45,149 +61,140 @@ class AdminLogin(BaseModel):
 def create_app(*, data_dir: str | Path | None = None, production: bool = False) -> FastAPI:
     if not production_secrets_valid(production=production):
         raise RuntimeError("BILINGUALPDF_ADMIN_TOKEN and BILINGUALPDF_SESSION_SECRET are required in production")
-    root = Path(data_dir or os.getenv("BILINGUALPDF_DATA_DIR", "data"))
+    root = Path(data_dir or os.getenv("BILINGUALPDF_DATA_DIR", "data")).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    repo = get_config_repository(str(root))
+    config = get_config_repository(str(root))
+    history = HistoryRepository(root / "history.sqlite3", root / "tasks")
+    manager = TranslationTaskManager(history, config)
     admin_token = os.getenv("BILINGUALPDF_ADMIN_TOKEN", "dev-admin-token")
-    app = FastAPI(title="BilingualPDF", docs_url=None, redoc_url=None)
-    app.state.config_repo = repo
-    basic = HTTPBasic(auto_error=False)
     session_secret = os.getenv("BILINGUALPDF_SESSION_SECRET", "dev-session-secret")
-    admin_cookie = hmac.new(
-        session_secret.encode(), admin_token.encode(), hashlib.sha256
-    ).hexdigest()
+    admin_cookie = hmac.new(session_secret.encode(), admin_token.encode(), hashlib.sha256).hexdigest()
+
+    app = FastAPI(title="BilingualPDF", docs_url=None, redoc_url=None)
+    app.state.config_repo = config
+    app.state.history_repo = history
+    app.state.task_manager = manager
+    basic = HTTPBasic(auto_error=False)
+
+    class SessionCookieMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            cookie = request.cookies.get("bilingualpdf_session")
+            owner = owner_hash_from_cookie(cookie or "", session_secret)
+            new_cookie = None
+            if not owner:
+                new_cookie = make_owner_cookie(session_secret)
+                owner = owner_hash_from_cookie(new_cookie, session_secret)
+            request.state.owner_id = owner
+            response = await call_next(request)
+            if new_cookie and not request.url.path.startswith("/admin"):
+                response.set_cookie(
+                    "bilingualpdf_session", new_cookie, max_age=180 * 86400,
+                    httponly=True, samesite="lax", secure=production,
+                )
+            return response
+
+    app.add_middleware(SessionCookieMiddleware)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok", "service": "BilingualPDF"}
 
     async def retention_loop() -> None:
-        from pdf2zh_next.history import history_repository
-
         while True:
-            history_repository.cleanup_retention(file_days=7, job_days=90)
+            history.cleanup_retention(file_days=7, job_days=90)
             await asyncio.sleep(6 * 3600)
 
     @app.on_event("startup")
-    async def start_retention_cleanup() -> None:
+    async def startup() -> None:
+        history.cleanup_retention(file_days=7, job_days=90)
         app.state.retention_task = asyncio.create_task(retention_loop())
 
     @app.on_event("shutdown")
-    async def stop_retention_cleanup() -> None:
+    async def shutdown() -> None:
         task = getattr(app.state, "retention_task", None)
         if task:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        history.close()
 
-    def is_admin(
-        request: Request,
-        credentials: HTTPBasicCredentials | None,
-        x_admin_token: str | None,
-    ) -> bool:
-        cookie_ok = validate_admin_token(
-            request.cookies.get("bilingualpdf_admin"), admin_cookie
-        )
-        header_ok = validate_admin_token(x_admin_token, admin_token)
-        basic_ok = bool(
-            credentials
-            and validate_admin_token(credentials.username, "admin")
-            and validate_admin_token(credentials.password, admin_token)
-        )
-        return cookie_ok or header_ok or basic_ok
+    def is_admin(request: Request, credentials: HTTPBasicCredentials | None, header: str | None) -> bool:
+        return any((
+            validate_admin_token(request.cookies.get("bilingualpdf_admin"), admin_cookie),
+            validate_admin_token(header, admin_token),
+            bool(credentials and validate_admin_token(credentials.username, "admin") and validate_admin_token(credentials.password, admin_token)),
+        ))
 
     def require_admin(
         request: Request,
-        credentials: HTTPBasicCredentials | None = Depends(basic),
+        credentials: HTTPBasicCredentials | None = Depends(basic),  # noqa: B008
         x_admin_token: str | None = Header(default=None),
     ) -> None:
         if not is_admin(request, credentials, x_admin_token):
-            raise HTTPException(
-                status_code=401,
-                detail="管理员认证失败",
-            )
-
-    def login_page() -> str:
-        return '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>管理登录</title><style>
-        :root{font-family:system-ui;color:#172033;background:#f4f6f8}body{min-height:90vh;display:grid;place-items:center;margin:0;padding:20px}.login{width:min(400px,100%);box-sizing:border-box;background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:28px}h1{font-size:24px;margin-top:0}label{display:block;margin:16px 0}input{box-sizing:border-box;width:100%;min-height:44px;margin-top:6px;padding:9px;border:1px solid #aeb7c5;border-radius:6px}button{width:100%;min-height:44px;border:0;border-radius:6px;background:#d9287a;color:#fff;font-weight:650;cursor:pointer}#error{color:#b42318;min-height:24px}</style></head><body><main class="login"><h1>BilingualPDF 管理登录</h1><p>使用管理员账号和管理密钥登录。</p><form onsubmit="login(event)"><label>用户名<input name="username" value="admin" autocomplete="username"></label><label>管理密钥<input name="token" type="password" autocomplete="current-password" autofocus></label><p id="error"></p><button>登录</button></form></main><script>
-        async function login(e){e.preventDefault();const f=new FormData(e.target);const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:f.get('username'),token:f.get('token')})});if(r.ok){location.href='/admin'}else{document.querySelector('#error').textContent='用户名或管理密钥错误'}}</script></body></html>'''
+            raise HTTPException(status_code=401, detail="管理员认证失败")
 
     @app.post("/admin/login")
     def admin_login(login: AdminLogin) -> JSONResponse:
-        if not (
-            validate_admin_token(login.username, "admin")
-            and validate_admin_token(login.token, admin_token)
-        ):
+        if not (validate_admin_token(login.username, "admin") and validate_admin_token(login.token, admin_token)):
             raise HTTPException(status_code=401, detail="管理员认证失败")
         response = JSONResponse({"status": "ok"})
-        response.set_cookie(
-            "bilingualpdf_admin",
-            admin_cookie,
-            max_age=12 * 3600,
-            httponly=True,
-            secure=production,
-            samesite="strict",
-        )
+        response.set_cookie("bilingualpdf_admin", admin_cookie, max_age=12 * 3600, httponly=True, secure=production, samesite="strict")
         return response
 
-    @app.get("/admin", response_class=HTMLResponse)
-    def admin_page(
-        request: Request,
-        credentials: HTTPBasicCredentials | None = Depends(basic),
-        x_admin_token: str | None = Header(default=None),
-    ) -> str:
-        if not is_admin(request, credentials, x_admin_token):
-            return login_page()
-        from pdf2zh_next.history import history_repository
+    @app.post("/admin/logout", status_code=204)
+    def admin_logout() -> Response:
+        response = Response(status_code=204)
+        response.delete_cookie("bilingualpdf_admin")
+        return response
 
-        profiles = repo.profiles()
-        summary = history_repository.admin_summary()
-        cards = "".join(f'''<section><h2>{html.escape(p.label)}</h2><form onsubmit="saveTier(event,'{p.slug}')">
-          <label>模型 ID<input name="model" value="{html.escape(p.model, quote=True)}"></label>
-          <label>API 地址<input name="base_url" value="{html.escape(p.base_url, quote=True)}"></label>
-          <div class="grid"><label>超时<input name="timeout" type="number" value="{p.timeout}"></label><label>Temperature<input name="temperature" type="number" step="0.1" value="{p.temperature}"></label><label>QPS<input name="qps" type="number" step="0.1" value="{p.qps}"></label><label>工作线程<input name="workers" type="number" value="{p.workers}"></label></div>
-          <label><input name="enabled" type="checkbox" {'checked' if p.enabled else ''}> 启用（当前版本 {p.version}）</label>
-          <button>保存新版本</button></form>
-          <form onsubmit="testTier(event,'{p.slug}')"><label>临时测试 Key<input name="api_key" type="password" autocomplete="off"></label><button class="secondary">发送最小测试请求（可能产生费用）</button></form></section>''' for p in profiles)
-        return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>BilingualPDF 管理后台</title><style>
-        :root{{font-family:system-ui;color:#172033;background:#f4f6f8}}body{{max-width:960px;margin:32px auto;padding:0 20px}}header{{display:flex;justify-content:space-between;align-items:center}}section{{background:white;border:1px solid #d9dee7;border-radius:8px;padding:20px;margin:16px 0}}label{{display:block;margin:12px 0}}input{{box-sizing:border-box;width:100%;min-height:44px;margin-top:6px;padding:9px;border:1px solid #aeb7c5;border-radius:6px}}input[type=checkbox]{{width:auto;min-height:auto}}.grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}}button{{min-height:44px;padding:0 16px;border:0;border-radius:6px;background:#d9287a;color:white;font-weight:650;cursor:pointer}}button.secondary{{background:#273449}}#status{{position:sticky;top:8px;padding:12px;background:#172033;color:white;border-radius:6px;display:none}}@media(max-width:600px){{.grid{{grid-template-columns:1fr}}}}</style></head><body><header><div><h1>BilingualPDF 管理后台</h1><p>渠道、档位及运行策略</p></div><a href="/">返回用户端</a></header><div id="status"></div>{cards}<section><h2>维护</h2><button class="secondary" onclick="cleanup()">立即执行保留清理</button></section><script>
-        const status=(text,ok=true)=>{{const e=document.querySelector('#status');e.style.display='block';e.style.background=ok?'#18794e':'#b42318';e.textContent=text}};
-        async function saveTier(e,slug){{e.preventDefault();const f=new FormData(e.target), body={{slug,model:f.get('model'),base_url:f.get('base_url'),timeout:+f.get('timeout'),temperature:+f.get('temperature'),qps:+f.get('qps'),workers:+f.get('workers'),enabled:f.get('enabled')==='on'}};const r=await fetch('/admin/api/tiers',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});status(r.ok?'配置已保存，刷新后新任务生效':await r.text(),r.ok)}}
-        async function testTier(e,slug){{e.preventDefault();const key=new FormData(e.target).get('api_key');const r=await fetch('/admin/api/test',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{slug,api_key:key}})}});status(r.ok?'配置测试成功':await r.text(),r.ok);e.target.reset()}}
-        async function cleanup(){{const r=await fetch('/admin/api/cleanup',{{method:'POST'}});status(r.ok?'清理完成：'+JSON.stringify(await r.json()):await r.text(),r.ok)}}
-        </script></body></html>'''.replace(
-            "<div id=\"status\"></div>",
-            f"<div id=\"status\"></div><section><h2>任务概览</h2><div class=\"grid\"><div>任务：{summary['jobs']}</div><div>运行中：{summary['running']}</div><div>成功：{summary['succeeded']}</div><div>失败：{summary['failed']}</div><div>文件：{summary['files']}</div><div>页数：{summary['pages']}</div></div></section>",
-        )
+    @app.get("/admin/api/session")
+    def admin_session(_: None = Depends(require_admin)) -> dict[str, bool]:
+        return {"authenticated": True}
 
     @app.get("/admin/api/tiers")
-    def tiers(_: None = Depends(require_admin)) -> list[dict]:
-        return [{"slug": p.slug, "label": p.label, "model": p.model, "base_url": p.base_url, "enabled": p.enabled, "version": p.version} for p in repo.profiles()]
+    def tiers(_: None = Depends(require_admin)) -> dict:
+        return {
+            "default_tier": config.get_setting("default_tier", "standard"),
+            "tiers": [profile.__dict__ for profile in config.profiles()],
+        }
 
     @app.post("/admin/api/tiers")
     def save_tier(update: TierUpdate, _: None = Depends(require_admin)) -> dict:
-        if update.slug == "advanced" and update.enabled and not repo.get_setting(f"tested:{update.slug}:{update.model}", False):
+        if update.slug == "advanced" and update.enabled and not config.get_setting(f"tested:{update.slug}:{update.model}", False):
             raise HTTPException(status_code=409, detail="高级版必须使用临时 Key 测试成功后才能启用")
-        repo.set_setting("provider_base_url", update.base_url)
-        version = repo.save_profile(TierProfile(**update.model_dump(), label="", version=0))
+        config.set_setting("provider_base_url", update.base_url)
+        try:
+            version = config.save_profile(TierProfile(**update.model_dump(), label="", version=0))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"slug": update.slug, "version": version}
+
+    @app.post("/admin/api/default-tier/{slug}")
+    def set_default_tier(slug: str, _: None = Depends(require_admin)) -> dict[str, str]:
+        try:
+            profile = config.get_profile(slug)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="档位不存在") from exc
+        if not profile.enabled:
+            raise HTTPException(status_code=409, detail="默认档位必须已启用")
+        config.set_setting("default_tier", slug)
+        return {"default_tier": slug}
 
     @app.get("/admin/api/tiers/{slug}/versions")
     def versions(slug: str, _: None = Depends(require_admin)) -> list[dict]:
-        return repo.versions(slug)
+        return config.versions(slug)
 
     @app.get("/admin/api/audit")
     def audit(_: None = Depends(require_admin)) -> list[dict]:
-        return repo.audit_log()
+        return config.audit_log()
 
     @app.get("/admin/api/usage")
     def usage(_: None = Depends(require_admin)) -> dict:
-        from pdf2zh_next.history import history_repository
-        return {"summary": history_repository.admin_summary(), "failures": history_repository.recent_failures()}
+        return {"summary": history.admin_summary(), "failures": history.recent_failures()}
 
     @app.post("/admin/api/test")
     async def test_tier(test: TierTest, _: None = Depends(require_admin)) -> dict[str, str]:
-        profile = repo.get_profile(test.slug)
+        profile = config.get_profile(test.slug)
         if not test.api_key.strip():
             raise HTTPException(status_code=400, detail="请输入临时测试 Key")
         try:
@@ -200,37 +207,41 @@ def create_app(*, data_dir: str | Path | None = None, production: bool = False) 
             response.raise_for_status()
         except Exception as exc:
             raise HTTPException(status_code=400, detail="配置测试失败，请检查 Key、地址和模型") from exc
-        repo.set_setting(f"tested:{test.slug}:{profile.model}", True)
+        config.set_setting(f"tested:{test.slug}:{profile.model}", True)
         return {"status": "ok"}
 
     @app.post("/admin/api/tiers/{slug}/rollback/{version}")
     def rollback(slug: str, version: int, _: None = Depends(require_admin)) -> dict[str, str]:
-        repo.rollback(slug, version)
+        try:
+            config.rollback(slug, version)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="配置版本不存在") from exc
         return {"status": "ok"}
 
     @app.post("/admin/api/cleanup")
     def cleanup(_: None = Depends(require_admin)) -> dict[str, int]:
-        from pdf2zh_next.history import history_repository
-        return history_repository.cleanup_retention()
+        return history.cleanup_retention()
 
-    # Mounting is intentionally done after admin routes so /admin cannot be
-    # swallowed by Gradio's catch-all handler.
-    from pdf2zh_next.gui import demo
-    import gradio as gr
-    from starlette.middleware.base import BaseHTTPMiddleware
+    app.include_router(create_api_router(manager, root / "staging"))
 
-    class SessionCookieMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            response = await call_next(request)
-            if request.url.path.startswith("/admin") or request.cookies.get("bilingualpdf_session"):
-                return response
-            secret = os.getenv("BILINGUALPDF_SESSION_SECRET", "dev-session-secret")
-            from pdf2zh_next.runtime import make_owner_cookie
-            response.set_cookie("bilingualpdf_session", make_owner_cookie(secret), max_age=180 * 86400, httponly=True, samesite="lax", secure=production)
-            return response
+    if os.getenv("BILINGUALPDF_ENABLE_LEGACY", "").lower() in {"1", "true", "yes"}:
+        import gradio as gr
 
-    app.add_middleware(SessionCookieMiddleware)
-    app = gr.mount_gradio_app(app, demo, path="")
+        from pdf2zh_next.gui import demo
+        app = gr.mount_gradio_app(app, demo, path="/legacy")
+
+    frontend = Path(__file__).resolve().parent / "frontend_dist"
+    assets = frontend / "assets"
+    if assets.exists():
+        app.mount("/assets", StaticFiles(directory=assets), name="frontend-assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def spa(path: str) -> FileResponse:  # noqa: ARG001
+        index = frontend / "index.html"
+        if not index.exists():
+            raise HTTPException(status_code=503, detail="React 前端尚未构建，请运行 npm run build")
+        return FileResponse(index, media_type="text/html")
+
     return app
 
 

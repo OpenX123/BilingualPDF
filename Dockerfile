@@ -1,3 +1,11 @@
+FROM node:22-bookworm-slim AS frontend
+
+WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
 WORKDIR /app
@@ -26,6 +34,7 @@ COPY pyproject.toml .
 RUN uv pip install --system --no-cache -r pyproject.toml && babeldoc --version && babeldoc --warmup
 
 COPY . .
+COPY --from=frontend /build/pdf2zh_next/frontend_dist /app/pdf2zh_next/frontend_dist
 
 # Calls for a random number to break the cahing of babeldoc upgrade
 # (https://stackoverflow.com/questions/35134713/disable-cache-for-specific-run-commands/58801213#58801213)

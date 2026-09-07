@@ -36,6 +36,8 @@ PDF scientific paper translation and bilingual comparison. Based on [BabelDOC](h
 - 🌐 Support [multiple languages](https://openx123.github.io/BilingualPDF/supported_languages.html), and diverse [translation services](https://openx123.github.io/BilingualPDF/advanced/Documentation-of-Translation-Services.html).
 - 🤖 Provides [commandline tool](https://openx123.github.io/BilingualPDF/getting-started/USAGE_commandline.html), [interactive user interface](https://openx123.github.io/BilingualPDF/getting-started/USAGE_webui.html), and [Docker](https://openx123.github.io/BilingualPDF/getting-started/INSTALLATION_docker.html)
 
+The public WebUI uses a React client backed by FastAPI job APIs. Run `npm ci && npm run build` in `frontend/` when changing the interface. The legacy Gradio interface is available at `/legacy` only when `BILINGUALPDF_ENABLE_LEGACY=1` is set.
+
 
 > [!WARNING]
 >

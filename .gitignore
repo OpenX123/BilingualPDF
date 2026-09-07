@@ -136,6 +136,8 @@ celerybeat.pid
 # Environments
 .env
 .venv
+/frontend/node_modules/
+*.tsbuildinfo
 env/
 venv/
 ENV/

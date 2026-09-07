@@ -89,6 +89,19 @@ async def main() -> int:
     babeldoc.assets.assets.warmup()
 
     if settings.basic.gui:
+        if not settings.gui_settings.auth_file and not settings.gui_settings.share:
+            import uvicorn
+
+            from pdf2zh_next.host import create_app
+
+            app = create_app(production=bool(os.getenv("BILINGUALPDF_PRODUCTION")))
+            uvicorn.run(
+                app,
+                host="0.0.0.0",  # noqa: S104 - the WebUI must be reachable outside the container
+                port=settings.gui_settings.server_port,
+                log_level="info",
+            )
+            return 0
         from pdf2zh_next.gui import setup_gui
 
         setup_gui(
